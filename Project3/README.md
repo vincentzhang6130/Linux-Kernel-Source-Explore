@@ -5,24 +5,35 @@
 1. 取得程式 context switch 的次數
 1. 取得程式進入 waiting queue 的次數
 
-> https://staff.csie.ncu.edu.tw/hsufh/COURSES/FALL2021/linux_project_3.html
+>https://staff.csie.ncu.edu.tw/hsufh/COURSES/FALL2021/linux_project_3.html
+
 ## 先備知識
 
-https://blog.csdn.net/gatieme/article/details/51569932
-
 ### `fork()`
-完全複製父行程的資源，子行程獨立於父行程， 但是二者之間的通訊需要通過專門的通訊機制如：pipe，popen&pclose、協同進程、fifo，System V IPC（消息隊列、信號量和共享內存）機制等。
-Linux中採取了copy-on-write技術減少無用複製。
-https://blog.xuite.net/ian11832/blogg/23967641
+完全複製父行程的資源，子行程獨立於父行程。
+>https://blog.csdn.net/gatieme/article/details/51569932
+>https://blog.xuite.net/ian11832/blogg/23967641
 
+Linux中採取了copy-on-write技術減少無用複製。
 ### copy_on_write
+言下之意就是要write時才copy，當複製出新的子process時，先讓其直接共用父process的內容，若要改子process內容時，才複製出父process的副本並修改。
+>https://hackmd.io/@linD026/Linux-kernel-COW-Copy-on-Write
+
+
+Linux 建立新 task 的共同 function 為copy_process()
+![](https://i.imgur.com/tCrz3hT.png)
 
 
 ## Code Trace
+在`task_struct`新增變數，並在對的地方計數。
+
 ![](https://i.imgur.com/4wwZqxh.png)
 
 ### `task_struct`
-修改 task_struct的code，新增用來計數的變數。
+`/include/linux/sched.h`
+
+修改 task_struct的code，新增用來計數的變數，不過要在`randomized_struct_fields_start`及`randomized_struct_fields_end` 的中間新增，因為為了增加kernel的安全性，kernel使用了編譯器提供的 randomize layout，目的是在編譯期將 struct 中的欄位排序隨機化，這樣可以對 struct 中的數據提供一定的保護能力，入侵者無法根據原始碼就能掌握 struct 中的所有數據位址。
+
 ```clike=
 struct task_struct {
 #ifdef CONFIG_THREAD_INFO_IN_TASK
@@ -33,7 +44,14 @@ struct task_struct {
 	struct thread_info		thread_info;
 #endif
 	/* -1 unrunnable, 0 runnable, >0 stopped: */
+        /*大於0??*/
 	volatile long			state;
+        /*
+	 * This begins the randomizable portion of task_struct. Only
+	 * scheduling-critical items should be added above here.
+	 */
+	randomized_struct_fields_start /*randomize layout 開始*/
+    
 /*
  ...
  中間程式碼太多先省略
@@ -54,7 +72,7 @@ struct task_struct {
 	 * New fields for task_struct should be added above here, so that
 	 * they are included in the randomized portion of task_struct.
 	 */
-	randomized_struct_fields_end
+	randomized_struct_fields_end /*randomize layout 結束*/
 
 	/* CPU-specific state of this task: */
 	struct thread_struct		thread;
@@ -71,6 +89,7 @@ struct task_struct {
 
 
 ### `do_fork()` 
+
 ```clike=
 long do_fork(unsigned long clone_flags,
 	      unsigned long stack_start,
@@ -96,6 +115,7 @@ long do_fork(unsigned long clone_flags,
 ```
 
 ### `_do_fork()`
+
 ```clike=
 long _do_fork(struct kernel_clone_args *args)
 {
@@ -166,12 +186,17 @@ long _do_fork(struct kernel_clone_args *args)
 
 
 ### `copy_process()`
+`/kernel/fork.c`
+
 Here is a brief overview of how copy_process() works:
 1. It first allocates memory for the new struct task_struct structure and sets up the basic fields of the structure.
 1. It then ==copies the memory and other resources of the existing process to the new process.== This includes copying the program code, data, and stack of the process, as well as any open file descriptors and other resources.
 1. It sets up the new process's execution context, including the program counter, stack pointer, and other registers.
 1. It adds the new process to the system's list of processes and assigns it a unique process ID. 
 1. It ==returns a pointer to the new struct task_struct structure, which can be used== to control and manipulate the new process.
+
+
+
 ```clike=
 static __latent_entropy struct task_struct *copy_process(
 					struct pid *pid,
@@ -207,11 +232,9 @@ static __latent_entropy struct task_struct *copy_process(
 ### `schedule()`
 The Linux kernel's scheduling function, called schedule(), is responsible for deciding which process should be executed next by the CPU. 
 
-決定要跑哪個process，
-例如：wait系列的function會呼叫其把cpu的控制權交出去
+決定要跑哪個process，例如：wait系列的function會呼叫其把cpu的控制權交出去
 
-
-https://zhuanlan.zhihu.com/p/363791563
+>https://zhuanlan.zhihu.com/p/363791563
 
 主要重要步驟在`__schedule()`中
 ```clike=
@@ -230,6 +253,8 @@ asmlinkage __visible void __sched schedule(void)
 ```
 
 ### `__schedule(false)`
+`/kernel/sched/core.c`
+
 __schedule() is responsible for selecting the next process to run and switching to that process's execution context. It does this by examining the list of runnable processes in the system and selecting the one with the highest priority. It then saves the current process's execution context and restores the execution context of the selected process.
 
 裡面又再呼叫到`context_switch()`
@@ -253,7 +278,7 @@ static void __sched notrace __schedule(bool preempt)
 	if (sched_feat(HRTICK))
 		hrtick_clear(rq);
 
-	local_irq_disable();
+	local_irq_disable(); /*防止當前cpu被中斷*/
 	rcu_note_context_switch(preempt);
 
 	/*
@@ -351,7 +376,10 @@ static void __sched notrace __schedule(bool preempt)
 		psi_sched_switch(prev, next, !task_on_rq_queued(prev));
 
 		trace_sched_switch(preempt, prev, next);
-
+               /* 當前 process 的 context switch 次數加一 */
+               //prev->cs_count++;
+               /* 切換過去的 process context switch 次數加一 */
+               //next->cs_count++;    
 		/* Also unlocks the rq: */
 		rq = context_switch(rq, prev, next, &rf);
 	} else {
@@ -368,9 +396,9 @@ static void __sched notrace __schedule(bool preempt)
 
 A context switch is the process by which the kernel switches the execution of a process from one CPU to another. There are two types of context switches: voluntary and involuntary.
 
-A **voluntary context switch** occurs when a process voluntarily yields the CPU, such as when it calls the sched_yield() system call or when it blocks waiting for a resource. In this case, the **nvcsw** field is incremented.
+A **voluntary context switch** (自願切換) occurs when a process voluntarily yields the CPU, such as when it calls the sched_yield() system call or when it blocks waiting for a resource. In this case, the **nvcsw** field is incremented. (等待I/O即屬於這種類型)
 
-An **involuntary context** switch occurs when the kernel forces a process to yield the CPU, such as ==when a higher-priority process becomes runnable or when a timer interrupt occurs.== In this case, the **nivcsw** field is incremented.
+An **involuntary context switch** (非自願切換)occurs when the kernel forces a process to yield the CPU, such as ==when a higher-priority process becomes runnable or when a timer interrupt occurs.== In this case, the **nivcsw** field is incremented.
 
 kernel process don't have own `mm_struct` because they do not use virtual memory in the same way as user processes.
 
@@ -513,6 +541,128 @@ SYM_CODE_START(__switch_to_asm)
 	jmp	__switch_to
 SYM_CODE_END(__switch_to_asm)
 ```
+
+### `__switch_to`
+`/arch/x86/kernel/process_64.c`
+我們在這邊增加`cs_count`
+```clike=
+__visible __notrace_funcgraph struct task_struct *
+__switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+{
+	struct thread_struct *prev = &prev_p->thread;
+	struct thread_struct *next = &next_p->thread;
+	struct fpu *prev_fpu = &prev->fpu;
+	struct fpu *next_fpu = &next->fpu;
+	int cpu = smp_processor_id();
+    
+        prev_p->cs_count++;
+        if(prev_p->record_state){
+            printk(KERN_INFO "prev_p->state=%d\n", prev_p->state);
+            printk(KERN_INFO "next_p->state=%d\n", next_p->state);
+            printk(KERN_INFO "Do context switch\n");
+            printk(KERN_INFO "----------------\n");
+        }
+        
+        WARN_ON_ONCE(IS_ENABLED(CONFIG_DEBUG_ENTRY) &&
+		     this_cpu_read(irq_count) != -1);
+
+	if (!test_thread_flag(TIF_NEED_FPU_LOAD))
+		switch_fpu_prepare(prev_fpu, cpu);
+
+	/* We must save %fs and %gs before load_TLS() because
+	 * %fs and %gs may be cleared by load_TLS().
+	 *
+	 * (e.g. xen_load_tls())
+	 */
+	save_fsgs(prev_p);
+
+	/*
+	 * Load TLS before restoring any segments so that segment loads
+	 * reference the correct GDT entries.
+	 */
+	load_TLS(next, cpu);
+
+	/*
+	 * Leave lazy mode, flushing any hypercalls made here.  This
+	 * must be done after loading TLS entries in the GDT but before
+	 * loading segments that might reference them.
+	 */
+	arch_end_context_switch(next_p);
+
+	/* Switch DS and ES.
+	 *
+	 * Reading them only returns the selectors, but writing them (if
+	 * nonzero) loads the full descriptor from the GDT or LDT.  The
+	 * LDT for next is loaded in switch_mm, and the GDT is loaded
+	 * above.
+	 *
+	 * We therefore need to write new values to the segment
+	 * registers on every context switch unless both the new and old
+	 * values are zero.
+	 *
+	 * Note that we don't need to do anything for CS and SS, as
+	 * those are saved and restored as part of pt_regs.
+	 */
+	savesegment(es, prev->es);
+	if (unlikely(next->es | prev->es))
+		loadsegment(es, next->es);
+
+	savesegment(ds, prev->ds);
+	if (unlikely(next->ds | prev->ds))
+		loadsegment(ds, next->ds);
+
+	x86_fsgsbase_load(prev, next);
+
+	/*
+	 * Switch the PDA and FPU contexts.
+	 */
+	this_cpu_write(current_task, next_p);
+	this_cpu_write(cpu_current_top_of_stack, task_top_of_stack(next_p));
+
+	switch_fpu_finish(next_fpu);
+
+	/* Reload sp0. */
+	update_task_stack(next_p);
+
+	switch_to_extra(prev_p, next_p);
+
+	if (static_cpu_has_bug(X86_BUG_SYSRET_SS_ATTRS)) {
+		/*
+		 * AMD CPUs have a misfeature: SYSRET sets the SS selector but
+		 * does not update the cached descriptor.  As a result, if we
+		 * do SYSRET while SS is NULL, we'll end up in user mode with
+		 * SS apparently equal to __USER_DS but actually unusable.
+		 *
+		 * The straightforward workaround would be to fix it up just
+		 * before SYSRET, but that would slow down the system call
+		 * fast paths.  Instead, we ensure that SS is never NULL in
+		 * system call context.  We do this by replacing NULL SS
+		 * selectors at every context switch.  SYSCALL sets up a valid
+		 * SS, so the only way to get NULL is to re-enter the kernel
+		 * from CPL 3 through an interrupt.  Since that can't happen
+		 * in the same task as a running syscall, we are guaranteed to
+		 * context switch between every interrupt vector entry and a
+		 * subsequent SYSRET.
+		 *
+		 * We read SS first because SS reads are much faster than
+		 * writes.  Out of caution, we force SS to __KERNEL_DS even if
+		 * it previously had a different non-NULL value.
+		 */
+		unsigned short ss_sel;
+		savesegment(ss, ss_sel);
+		if (ss_sel != __KERNEL_DS)
+			loadsegment(ss, __KERNEL_DS);
+	}
+
+	/* Load the Intel cache allocation PQR MSR. */
+	resctrl_sched_in();
+
+	return prev_p;
+}
+
+```
+
+
 ### `wait_event`
 
 讓process進到wait queue休眠
@@ -522,14 +672,8 @@ SYM_CODE_END(__switch_to_asm)
 
 
 ### `__wait_up_common`
-參數說明
-- wq_head：wq的頭
-- mode：process的狀態模式
-- nr_exclusive：是 number exclusive??
-- wake_flags  : 是同步唤醒sync，还是异步唤醒 async??
-- key : 一般为NULL
 
-https://blog.51cto.com/weiguozhihui/1566980
+>https://blog.51cto.com/weiguozhihui/1566980
  
 ```clike=
 static int __wake_up_common(struct wait_queue_head *wq_head, unsigned int mode,
@@ -593,6 +737,7 @@ int default_wake_function(wait_queue_entry_t *curr, unsigned mode, int wake_flag
 呼叫`ttwu_queue()` 這個 funtion 然後 ttwu_queue() -> `ttwu_do_activate()` -> `ttwu_do_wakeup()`
 
 ### `ttwu_do_wakeup`
+`/kernel/sched/core.c`
 
 由於每個進入waiting queue的process ，在等待完I/O後會就會出來，所以我們在叫醒process的這段code進行計數。
 
@@ -652,7 +797,7 @@ SYSCALL_DEFINE1(get_number_of_context_switches, unsigned int*, count) {
     unsigned int answer = current->cs_count;
     printk("pid = %d ; cs_count = %u ; nvcsw = %lu ; nivcsw = %lu\n",
            current->pid, answer, current->nvcsw, current->nivcsw);
-    return -copy_to_user(count, &(answer), sizeof(unsigned int));
+    return copy_to_user(count, &(answer), sizeof(unsigned int));
 }
 ```
 
@@ -688,13 +833,8 @@ int main(){
 }
 ```
 #### 執行結果
-![](https://i.imgur.com/iwplkMe.png)
+![](https://i.imgur.com/zLnK3Vk.png)
 
-![](https://i.imgur.com/66uKmhU.png)
-
-1. `nvcsw` : 自願切換數
-2. `nivcsw` : 非自願切換數
-3. `cs_count` : 從下圖可看出，此值為 $(nvcsw+nivcsw)*2+1$，其中因為 cs_count 因為來回都有做計算，所以會是 $(nvcsw+nivcsw)$ 的兩倍，而 $+1$ 是因為我們在 `print cs_count` 時，執行權在 `pid 2980`，所以會 $+1$。
 
 #### 用strace 分析
 ```bash=
@@ -718,9 +858,9 @@ strace -o strace_q1.out ./q1
 
 SYSCALL_DEFINE1(get_number_of_entering_a_wait_queue, unsigned int*, count) {
 
-        unsigned int answer = current->wq_count;
+    unsigned int answer = current->wq_count;
     printk("pid = %d ; wq_count = %u", current->pid, answer);
-    return -copy_to_user(count, &(answer), sizeof(unsigned int));
+    return copy_to_user(count, &(answer), sizeof(unsigned int));
 }
 
 ```
@@ -784,6 +924,10 @@ int main ()
 ```
 
 ![](https://i.imgur.com/eK6bCPi.png)
+
+因為打印字串的迴圈跑的時間太短，所以process只進waiting queue一次，所以我將迴圈設成跑更久
+![](https://i.imgur.com/TPtXG6z.png)
+process 跑完21行時只進waiting queue一次(用a變數紀錄)，最後又多進了waiting queue 30次。
 
 #### 用strace 分析
 ```bash=
